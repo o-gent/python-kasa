@@ -13,7 +13,14 @@ from kasa.transports.basetransport import BaseTransport
 
 
 class FakeSmartProtocol(SmartProtocol):
-    def __init__(self, info, fixture_name, *, is_child=False, verbatim=False):
+    def __init__(
+        self,
+        info: dict,
+        fixture_name: str,
+        *,
+        is_child: bool = False,
+        verbatim: bool = False,
+    ) -> None:
         super().__init__(
             transport=FakeSmartTransport(
                 info, fixture_name, is_child=is_child, verbatim=verbatim
@@ -89,6 +96,66 @@ class FakeSmartTransport(BaseTransport):
         return self._credentials.username + self._credentials.password + "hash"
 
     FIXTURE_MISSING_MAP = {
+        "get_sc_schedule_info": (
+            "smart_control_schedule",
+            {"enable": True, "mode": "weekday_sat_sun"},
+        ),
+        "get_sc_schedule_rules": (
+            "smart_control_schedule",
+            {
+                "schedule_mode": "weekday_sat_sun",
+                "day_segment": 6,
+                "start_index": 0,
+                "sum": 3,
+                "schedule_list": [
+                    {
+                        "id": f"weekday_sat_sun:{day}",
+                        "rule_list": [
+                            {
+                                "start_min": start,
+                                "end_min": end,
+                                "desired_states": {
+                                    "target_temp": temp,
+                                    "target_temp_float": temp * 10,
+                                    "frost_protection_on": False,
+                                    "temp_unit": "celsius",
+                                },
+                            }
+                            # Devices may return slots out of order
+                            for start, end, temp in sorted(
+                                ((0, 419, 18), (420, 1319, 21), (1320, 1439, 18)),
+                                reverse=day == "saturday",
+                            )
+                        ],
+                    }
+                    for day in ("sunday", "weekday", "saturday")
+                ],
+            },
+        ),
+        "get_temperature_correction": (
+            "temperature_correction",
+            {
+                "use_other_temp_sensor": False,
+                "offset": 0,
+                "temp_sensor_device_id": "SCRUBBED_CHILD_DEVICE_ID_1",
+                "using_other_temp_sensor": False,
+            },
+        ),
+        "get_temperature_records": (
+            "temp_record",
+            {"temp_data": [-1000] * 88 + [253, 254, 256, 255, 252, 249, 247, 245]},
+        ),
+        "get_temp_humidity_records": (
+            "temp_humidity_record",
+            {
+                "local_time": 1713550233,
+                "past24h_temp": [-1000] * 92 + [195, 196, 194, 193],
+                "past24h_temp_exception": [0] * 96,
+                "past24h_humidity": [-1000] * 92 + [58, 57, 55, 54],
+                "past24h_humidity_exception": [0] * 96,
+                "temp_unit": "celsius",
+            },
+        ),
         "get_wireless_scan_info": ("wireless", {"ap_list": [], "wep_supported": False}),
         "get_auto_off_config": ("auto_off", {"delay_min": 10, "enable": False}),
         "get_led_info": (
@@ -198,7 +265,7 @@ class FakeSmartTransport(BaseTransport):
         ),
     }
 
-    def _missing_result(self, method):
+    def _missing_result(self, method: str):
         """Check the FIXTURE_MISSING_MAP for responses.
 
         Fixtures generated prior to a query being supported by dump_devinfo
@@ -242,7 +309,10 @@ class FakeSmartTransport(BaseTransport):
 
     @staticmethod
     def _get_child_protocols(
-        parent_fixture_info, parent_fixture_name, child_devices_key, verbatim
+        parent_fixture_info: dict,
+        parent_fixture_name: str,
+        child_devices_key: str,
+        verbatim: bool,
     ):
         child_infos = parent_fixture_info.get(child_devices_key, {}).get(
             "child_device_list", []
@@ -250,13 +320,14 @@ class FakeSmartTransport(BaseTransport):
         if not child_infos:
             return
         found_child_fixture_infos = []
-        child_protocols = {}
+        child_protocols: dict[str, SmartProtocol] = {}
         # imported here to avoid circular import
         from .conftest import filter_fixtures
 
-        def try_get_child_fixture_info(child_dev_info, protocol):
+        def try_get_child_fixture_info(child_dev_info: dict, protocol: str):
             hw_version = child_dev_info["hw_ver"]
             sw_version = child_dev_info.get("sw_ver", child_dev_info.get("fw_ver"))
+            assert isinstance(sw_version, str)
             sw_version = sw_version.split(" ")[0]
             model = child_dev_info.get("device_model", child_dev_info.get("model"))
             assert sw_version
@@ -399,6 +470,7 @@ class FakeSmartTransport(BaseTransport):
             return {"result": result, "error_code": 0}
         elif child_method == "set_device_info":
             info.update(child_params)
+            self._update_trv_states(info)
             return {"error_code": 0}
         elif child_method == "set_preset_rules":
             return self._set_child_preset_rules(info, child_params)
@@ -436,7 +508,25 @@ class FakeSmartTransport(BaseTransport):
 
         raise NotImplementedError(f"Method {child_method} not implemented for children")
 
-    def _get_on_off_gradually_info(self, info, params):
+    def _update_trv_states(self, info: dict) -> None:
+        """Simulate TRV heating state after a device info update.
+
+        The device heats when frost protection is off and the target temperature
+        exceeds the current temperature.
+        """
+        if "trv_states" not in info:
+            return
+        should_heat = not info.get("frost_protection_on", False) and info.get(
+            "target_temp", 0
+        ) > info.get("current_temp", 0)
+        trv_states = set(info["trv_states"])
+        if should_heat:
+            trv_states.add("heating")
+        else:
+            trv_states.discard("heating")
+        info["trv_states"] = list(trv_states)
+
+    def _get_on_off_gradually_info(self, info: dict, params: dict | None):
         if self.components["on_off_gradually"] == 1:
             info["get_on_off_gradually_info"] = {"enable": True}
         else:
@@ -446,7 +536,7 @@ class FakeSmartTransport(BaseTransport):
             }
         return copy.deepcopy(info["get_on_off_gradually_info"])
 
-    def _set_on_off_gradually_info(self, info, params):
+    def _set_on_off_gradually_info(self, info: dict, params: dict):
         # Child devices can have the required properties directly in info
 
         # the _handle_control_child_missing directly passes in get_device_info
@@ -480,9 +570,15 @@ class FakeSmartTransport(BaseTransport):
                     info["get_on_off_gradually_info"]["off_state"]["duration"] = (
                         off_state["duration"]
                     )
+        elif (change_state := params.get("change_state")) and (
+            "get_on_off_gradually_info" in info
+        ):
+            info["get_on_off_gradually_info"]["change_state"]["enable"] = change_state[
+                "enable"
+            ]
         return {"error_code": 0}
 
-    def _set_dynamic_light_effect(self, info, params):
+    def _set_dynamic_light_effect(self, info: dict, params: dict) -> None:
         """Set or remove values as per the device behaviour."""
         info["get_device_info"]["dynamic_light_effect_enable"] = params["enable"]
         info["get_dynamic_light_effect_rules"]["enable"] = params["enable"]
@@ -495,7 +591,7 @@ class FakeSmartTransport(BaseTransport):
             if "current_rule_id" in info["get_dynamic_light_effect_rules"]:
                 del info["get_dynamic_light_effect_rules"]["current_rule_id"]
 
-    def _set_edit_dynamic_light_effect_rule(self, info, params):
+    def _set_edit_dynamic_light_effect_rule(self, info: dict, params: dict) -> None:
         """Edit dynamic light effect rule."""
         rules = info["get_dynamic_light_effect_rules"]["rule_list"]
         for rule in rules:
@@ -505,7 +601,7 @@ class FakeSmartTransport(BaseTransport):
 
         raise Exception("Unable to find rule with id")
 
-    def _set_light_strip_effect(self, info, params):
+    def _set_light_strip_effect(self, info: dict, params: dict) -> None:
         """Set or remove values as per the device behaviour."""
         # Brightness is not always available
         if (brightness := params.get("brightness")) is not None:
@@ -516,12 +612,12 @@ class FakeSmartTransport(BaseTransport):
             info["get_device_info"]["lighting_effect"]["id"] = params["id"]
             info["get_lighting_effect"] = copy.deepcopy(params)
 
-    def _set_led_info(self, info, params):
+    def _set_led_info(self, info: dict, params: dict) -> None:
         """Set or remove values as per the device behaviour."""
         info["get_led_info"]["led_status"] = params["led_rule"] != "never"
         info["get_led_info"]["led_rule"] = params["led_rule"]
 
-    def _set_preset_rules(self, info, params):
+    def _set_preset_rules(self, info: dict, params: dict):
         """Set or remove values as per the device behaviour."""
         if "brightness" not in info["get_preset_rules"]:
             return {"error_code": SmartErrorCode.PARAMS_ERROR}
@@ -535,7 +631,21 @@ class FakeSmartTransport(BaseTransport):
             ]
         return {"error_code": 0}
 
-    def _set_child_preset_rules(self, info, params):
+    def _edit_sc_schedule_rule(self, info: dict, params: dict):
+        """Replace the rules of one thermostat schedule."""
+        rules = info["get_sc_schedule_rules"]
+        # Devices only accept edits to the schedules of the active mode.
+        if params["schedule_mode"] != info["get_sc_schedule_info"]["mode"]:
+            return {"error_code": SmartErrorCode.UNSPECIFIC_ERROR.value}
+        if rules["schedule_mode"] != params["schedule_mode"]:
+            return {"error_code": SmartErrorCode.PARAMS_ERROR.value}
+        for schedule in rules["schedule_list"]:
+            if schedule["id"] == params["id"]:
+                schedule["rule_list"] = params["rule_list"]
+                return {"error_code": 0}
+        return {"error_code": SmartErrorCode.PARAMS_ERROR.value}
+
+    def _set_child_preset_rules(self, info: dict, params: dict):
         """Set or remove values as per the device behaviour."""
         # So far the only child device with light preset (KS240) has the
         # data available to read in the device_info.  If a child device
@@ -545,14 +655,14 @@ class FakeSmartTransport(BaseTransport):
         info["preset_state"] = [{"brightness": b} for b in params["brightness"]]
         return {"error_code": 0}
 
-    def _edit_preset_rules(self, info, params):
+    def _edit_preset_rules(self, info: dict, params: dict):
         """Set or remove values as per the device behaviour."""
-        if "states" not in info["get_preset_rules"] is None:
+        if info["get_preset_rules"].get("states") is None:
             return {"error_code": SmartErrorCode.PARAMS_ERROR}
         info["get_preset_rules"]["states"][params["index"]] = params["state"]
         return {"error_code": 0}
 
-    def _set_temperature_unit(self, info, params):
+    def _set_temperature_unit(self, info: dict, params: dict):
         """Set or remove values as per the device behaviour."""
         unit = params["temp_unit"]
         if unit not in {"celsius", "fahrenheit"}:
@@ -573,7 +683,7 @@ class FakeSmartTransport(BaseTransport):
 
         return {"error_code": 0}
 
-    def _hub_remove_device(self, info, params):
+    def _hub_remove_device(self, info: dict, params: dict):
         """Remove hub device."""
         items_to_remove = [dev["device_id"] for dev in params["child_device_list"]]
         children = info["get_child_device_list"]["child_device_list"]
@@ -584,10 +694,10 @@ class FakeSmartTransport(BaseTransport):
 
         return {"error_code": 0}
 
-    def get_child_device_queries(self, method, params):
+    def get_child_device_queries(self, method: str, params: dict):
         return self._get_method_from_info(method, params)
 
-    def _get_method_from_info(self, method, params):
+    def _get_method_from_info(self, method: str, params: dict | None):
         result = copy.deepcopy(self.info[method])
         if result and "start_index" in result and "sum" in result:
             list_key = next(
@@ -694,6 +804,8 @@ class FakeSmartTransport(BaseTransport):
             return self._set_on_off_gradually_info(info, params)
         elif method == "set_child_protection":
             return self._update_sysinfo_key(info, "child_protection", params["enable"])
+        elif method == "edit_sc_schedule_rule":
+            return self._edit_sc_schedule_rule(info, params)
         elif method == "remove_child_device_list":
             return self._hub_remove_device(info, params)
         # actions
@@ -704,6 +816,10 @@ class FakeSmartTransport(BaseTransport):
             "playSelectAudio",  # vacuum special actions
             "resetConsumablesTime",  # vacuum special actions
         ]:
+            return {"error_code": 0}
+        elif method == "set_device_info":
+            info["get_device_info"].update(params)
+            self._update_trv_states(info["get_device_info"])
             return {"error_code": 0}
         elif method[:3] == "set":
             target_method = f"get{method[3:]}"
